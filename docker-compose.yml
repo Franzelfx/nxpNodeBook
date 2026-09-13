@@ -1,0 +1,122 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# File:        docker-compose.yml
+# Author:      Fabian Franz
+# Company:     NexPatch AI
+# Created:     2026-09-13
+#
+# Description:
+#   Order-book / trade-tape node (standalone sub-repo):
+#     • book-db          TimescaleDB, owns the `book` database
+#     • nxp-book-api     FastAPI + WebSocket collectors + derive scheduler
+#
+# Ports:
+#   - 9130: Book API     (warehouse pulls this; 9100 btc, 9110 events, 9120 options)
+#   - 5437: Postgres     (host-exposed for ops; 5434 btc, 5435 events, 5436 options)
+#
+# CONFIDENTIAL – Proprietary. Unauthorized copying or distribution is prohibited.
+# © 2026 NexPatch AI. All rights reserved.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  book-db:
+    image: timescale/timescaledb:latest-pg16
+    container_name: nxp-book-db
+    restart: unless-stopped
+    env_file:
+      - ./.env
+    environment:
+      - POSTGRES_DB=${BOOK_DB_DATABASE:-book}
+      - POSTGRES_USER=${BOOK_DB_USER:-nxp_book}
+      - POSTGRES_PASSWORD=${BOOK_DB_PASSWORD:-nxp_book_pw_change_me}
+      - POSTGRES_INITDB_ARGS=-c shared_preload_libraries=timescaledb
+    command:
+      # The raw layer is written in 1-second COPY batches from three streams;
+      # a larger WAL segment budget keeps checkpoints from becoming the
+      # bottleneck, and synchronous_commit off is fine for data whose loss
+      # window (a second of ticks on a crash) is tiny next to the reconnect
+      # gap the same crash causes anyway.
+      - postgres
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - synchronous_commit=off
+      - -c
+      - shared_buffers=1GB
+    volumes:
+      # On the 879 G array, NOT the Docker volume root — same reasoning as the
+      # events and options nodes. Tick data is the largest raw layer in the
+      # estate; see the README for measured rates.
+      - ${BOOK_DB_DATA_DIR:-/mnt/warehouse/nxp-book/pgdata}:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5437:5432"
+    networks:
+      - book-network
+    mem_limit: 4g
+    memswap_limit: 4g
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${BOOK_DB_USER:-nxp_book} -d ${BOOK_DB_DATABASE:-book}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  nxp-book-api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+      # forwards the agent so the private nxp-node-contract pin resolves;
+      # the key is never written into a layer.
+      ssh:
+        - default
+    container_name: nxp-book-api
+    restart: unless-stopped
+    # Long enough to close three venue sessions and drain the writer queue;
+    # a SIGKILL here loses the last second of ticks AND leaves orphan runs.
+    stop_grace_period: 45s
+    env_file:
+      - ./.env
+    environment:
+      - BOOK_DB_HOST=book-db
+      - BOOK_DB_PORT=5432
+      - BOOK_DB_DATABASE=${BOOK_DB_DATABASE:-book}
+      - BOOK_DB_USER=${BOOK_DB_USER:-nxp_book}
+      - BOOK_DB_PASSWORD=${BOOK_DB_PASSWORD:-nxp_book_pw_change_me}
+      - NODE_ID=${NODE_ID:-nxp-book}
+      - BOOK_STREAMS=${BOOK_STREAMS:-binance_spot:BTCUSDT:btc.spot,binance_futures:BTCUSDT:btc.perp,deribit:BTC-PERPETUAL:btc.dperp}
+      - BOOK_COLLECTORS_ENABLED=${BOOK_COLLECTORS_ENABLED:-true}
+      - BOOK_SCHEDULER_ENABLED=${BOOK_SCHEDULER_ENABLED:-true}
+      - BOOK_SNAPSHOT_INTERVAL_SECONDS=${BOOK_SNAPSHOT_INTERVAL_SECONDS:-300}
+      - BOOK_SNAPSHOT_LEVELS=${BOOK_SNAPSHOT_LEVELS:-2000}
+      - BOOK_EVENTS_RETENTION_DAYS=${BOOK_EVENTS_RETENTION_DAYS:-0}
+      - BOOK_DEPTH_BANDS_BPS=${BOOK_DEPTH_BANDS_BPS:-10,50}
+      - BOOK_USER_AGENT
+    ports:
+      - "9130:9130"
+    mem_limit: 2g
+    memswap_limit: 2g
+    depends_on:
+      book-db:
+        condition: service_healthy
+    networks:
+      - book-network
+      - nxp-shared
+    healthcheck:
+      # Checks the contract's `ok`, not merely HTTP 200. /health deliberately
+      # answers 200 with ok=false while a stream is down — that is how a
+      # degraded node is told apart from a dead process.
+      test: ["CMD-SHELL", "python -c \"import json,urllib.request,sys; sys.exit(0 if json.load(urllib.request.urlopen('http://127.0.0.1:9130/health', timeout=5)).get('ok') else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+# ─────────────────────────────────────────────────────────────
+volumes: {}
+
+# ─────────────────────────────────────────────────────────────
+networks:
+  # Shared with the warehouse so it can reach http://nxp-book-api:9130
+  nxp-shared:
+    external: true
+  book-network:
+    driver: bridge
