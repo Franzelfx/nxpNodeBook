@@ -1,0 +1,25 @@
+# Rendered from the chart (externalServices.nxp-book-api in values-staging.yaml)
+# and applied by hand, because the staging release carries unrelated drift that
+# a helm upgrade would roll out. The helm annotations let the release adopt it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nxp-book-api
+  namespace: staging
+  labels:
+    app.kubernetes.io/name: nexpatch
+    helm.sh/chart: nexpatch-0.1.0
+    app.kubernetes.io/instance: nexpatch-staging
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: nxp-book-api
+  annotations:
+    meta.helm.sh/release-name: nexpatch-staging
+    meta.helm.sh/release-namespace: staging
+spec:
+  type: ExternalName
+  externalName: nxp-book-api.prod.svc.cluster.local
+  ports:
+  - name: http
+    port: 9130
+    protocol: TCP
+

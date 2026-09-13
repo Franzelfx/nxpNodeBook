@@ -168,7 +168,22 @@ cd api && python -m pytest -q
 ## 8. Status
 
 Collecting since **2026-09-13 19:54 UTC** on the warehouse host (compose).
-Reaching it from the cluster needs the same `Service`/`Endpoints` pair the
-other nodes had before their Phase-4 move (`externalServices.nxp-book-api`,
-ip 192.168.2.20, port 9130), then an `nxp_book` warehouse adapter that is a
-near-copy of `nxp_options`.
+
+**Cluster move prepared, not executed.** The chart carries `book-db`,
+`nxp-book-api`, PV/PVC `book-pgdata` (same hostPath the compose stack
+writes) in `values-prod.yaml`; the image is in the internal registry as
+`localhost:5000/nxp-book-api:prod-20260913-initial`; the `nxp-book-env`
+secret exists in prod; staging already resolves `nxp-book-api` via
+ExternalName; the monitoring manifests include the node. The cutover itself
+is one script — it stops compose, runs the helm upgrade, waits, verifies:
+
+```bash
+./scripts/cutover-to-k8s.sh --check   # preconditions + helm diff (six added objects, nothing changed)
+./scripts/cutover-to-k8s.sh           # the move; gap ≈ 1–2 min, declared in stream_runs
+```
+
+After the move the compose file stays as the local/dev runner. Never run
+both against the same pgdata.
+
+The warehouse still needs an `nxp_book` adapter (near-copy of `nxp_options`)
+before the columns reach a pipeline.
