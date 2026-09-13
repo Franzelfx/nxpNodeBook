@@ -87,14 +87,18 @@ Snapshots and trades are always kept. Fill in the measured rates below before
 deciding otherwise; a silent disk-fill is the failure this estate has already
 had once.
 
-Measured on 2026-09-13 in the first minutes (BTCUSDT, three streams):
+Measured on 2026-09-13 over the first 13 minutes (BTCUSDT / BTC-PERPETUAL,
+three streams, uncompressed hypertable size):
 
-| | msgs/s | rows/day | uncompressed |
-|---|---|---|---|
-| Binance spot depth | ~10 | ~0.86 M | see `book_events` chunk size after day 1 |
-| Binance futures depth | ~10 | ~0.86 M | |
-| Deribit book | ~3 | ~0.26 M | |
-| trades, all venues | ~30 | ~2.6 M | |
+| Table | rows / 13 min | size / 13 min | → per day (uncompressed) | → per year, compressed (~8–10×) |
+|---|---|---|---|---|
+| `book_events` | 18,600 | 20 MB | ~2.2 GB | ~80–100 GB |
+| `trades` | 9,900 | 2.6 MB | ~0.3 GB | ~12–15 GB |
+| `book_snapshots` | 15 | 0.5 MB | ~55 MB | ~2–3 GB |
+
+Per-stream message rates: Binance spot and futures ≈ 10 depth msgs/s each,
+Deribit ≈ 3/s; trades ≈ 6–8/s per Binance stream, < 1/s on Deribit. Re-measure
+after the first compressed chunk (day 3) before trusting the yearly column.
 
 ## 5. Derived columns
 
