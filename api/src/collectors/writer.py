@@ -50,6 +50,10 @@ class DBWriter:
         self._written: Dict[str, int] = {t: 0 for t in TABLES}
         self._stopping = False
         self._task: asyncio.Task | None = None
+        #: In-flight notify tasks. asyncio holds only a weak reference to a
+        #: running task, so without a strong one here the garbage collector
+        #: can cancel a notification mid-flight (doc/54 E5 review).
+        self._notify_tasks: set[asyncio.Task] = set()
         self._last_error: str | None = None
 
     # ── producer side ────────────────────────────────────────────────────
@@ -123,7 +127,14 @@ class DBWriter:
         # rate-limits itself and swallows everything.
         written = sum(self._written.values()) - before
         if written:
-            asyncio.create_task(self._announce(written))
+            # Held in a set until it finishes. asyncio keeps only a WEAK
+            # reference to a running task, so a bare `create_task` can be
+            # garbage-collected mid-flight — the notification vanishes with no
+            # error and no log, which for an optimisation nobody watches is
+            # the hardest kind of bug to notice.
+            task = asyncio.create_task(self._announce(written))
+            self._notify_tasks.add(task)
+            task.add_done_callback(self._notify_tasks.discard)
 
     async def _announce(self, rows: int) -> None:
         try:
