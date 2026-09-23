@@ -50,6 +50,10 @@ class DBWriter:
         self._written: Dict[str, int] = {t: 0 for t in TABLES}
         self._stopping = False
         self._task: asyncio.Task | None = None
+        #: In-flight notify tasks. asyncio holds only a weak reference to a
+        #: running task, so without a strong one here the garbage collector
+        #: can cancel a notification mid-flight (doc/54 E5 review).
+        self._notify_tasks: set[asyncio.Task] = set()
         self._last_error: str | None = None
 
     # ── producer side ────────────────────────────────────────────────────
@@ -110,8 +114,35 @@ class DBWriter:
                 await asyncio.sleep(max(0.05, interval - elapsed))
 
     async def _flush_all(self) -> None:
+        before = sum(self._written.values())
         for table in TABLES:
             await self._flush(table)
+
+        # doc/54 E5 — tell the warehouse rows landed, so a chart does not wait
+        # for its next poll to find out.
+        #
+        # Fire and forget, on this loop, never awaited by a COPY: the writer's
+        # own contract is that nothing here may block a collector, and a slow
+        # warehouse must not become a hole in the historical record. `announce`
+        # rate-limits itself and swallows everything.
+        written = sum(self._written.values()) - before
+        if written:
+            # Held in a set until it finishes. asyncio keeps only a WEAK
+            # reference to a running task, so a bare `create_task` can be
+            # garbage-collected mid-flight — the notification vanishes with no
+            # error and no log, which for an optimisation nobody watches is
+            # the hardest kind of bug to notice.
+            task = asyncio.create_task(self._announce(written))
+            self._notify_tasks.add(task)
+            task.add_done_callback(self._notify_tasks.discard)
+
+    async def _announce(self, rows: int) -> None:
+        try:
+            from src.collectors.notify import announce
+
+            await announce(rows)
+        except Exception as exc:  # noqa: BLE001 — an optimisation, never a duty
+            logger.debug("[writer] notify skipped: %s", exc)
 
     async def _flush(self, table: str) -> None:
         q = self._queues[table]
