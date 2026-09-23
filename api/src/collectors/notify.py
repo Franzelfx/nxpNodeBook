@@ -89,14 +89,18 @@ async def announce(rows: int, watermark: Optional[str] = None) -> bool:
         return False
     _last_sent = now
 
-    payload = f"{source_id}:{rows}:{watermark or ''}".encode()
+    # `ts` is inside the signature: without it a captured request is
+    # replayable forever. The warehouse refuses anything outside a 300 s
+    # window.
+    ts = int(time.time())
+    payload = f"{source_id}:{rows}:{watermark or ''}:{ts}".encode()
     signature = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
 
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT_S) as client:
             response = await client.post(
                 url,
-                json={"source_id": source_id, "rows": rows, "watermark": watermark},
+                json={"source_id": source_id, "rows": rows, "watermark": watermark, "ts": ts},
                 headers={"X-Nxp-Signature": signature},
             )
         if response.status_code >= 400:

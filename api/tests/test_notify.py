@@ -75,7 +75,11 @@ async def test_it_signs_what_it_sends(monkeypatch):
 
     assert await notify.announce(7, watermark="2026-09-23T10:00:00Z") is True
 
-    payload = b"ef5ff508-921d-4944-9bf3-5f1f729c894c:7:2026-09-23T10:00:00Z"
+    # The timestamp is INSIDE the signature — a captured request must not be
+    # replayable forever. The warehouse checks it against a 300 s window.
+    ts = sent["json"]["ts"]
+    assert ts > 0
+    payload = f"ef5ff508-921d-4944-9bf3-5f1f729c894c:7:2026-09-23T10:00:00Z:{ts}".encode()
     assert sent["headers"]["X-Nxp-Signature"] == hmac.new(
         b"test-secret", payload, hashlib.sha256
     ).hexdigest()
