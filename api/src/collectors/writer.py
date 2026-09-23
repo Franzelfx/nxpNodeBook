@@ -110,8 +110,28 @@ class DBWriter:
                 await asyncio.sleep(max(0.05, interval - elapsed))
 
     async def _flush_all(self) -> None:
+        before = sum(self._written.values())
         for table in TABLES:
             await self._flush(table)
+
+        # doc/54 E5 — tell the warehouse rows landed, so a chart does not wait
+        # for its next poll to find out.
+        #
+        # Fire and forget, on this loop, never awaited by a COPY: the writer's
+        # own contract is that nothing here may block a collector, and a slow
+        # warehouse must not become a hole in the historical record. `announce`
+        # rate-limits itself and swallows everything.
+        written = sum(self._written.values()) - before
+        if written:
+            asyncio.create_task(self._announce(written))
+
+    async def _announce(self, rows: int) -> None:
+        try:
+            from src.collectors.notify import announce
+
+            await announce(rows)
+        except Exception as exc:  # noqa: BLE001 — an optimisation, never a duty
+            logger.debug("[writer] notify skipped: %s", exc)
 
     async def _flush(self, table: str) -> None:
         q = self._queues[table]
