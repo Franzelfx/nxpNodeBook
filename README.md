@@ -75,6 +75,7 @@ book_snapshots  full in-memory book at every sync/resync and every 5 min     ←
 trades          every print, venue unit + USD notional                       ← capture-or-lose
 stream_runs     one row per WebSocket session                                ← declared gaps
 grid_features   the derived 5-min grid                                       ← recomputable
+derive_runs     one row per derive job, with its QA gate results             ← audit
 ```
 
 One row per **message**, not per level: `bids`/`asks` are jsonb arrays of
@@ -130,20 +131,53 @@ must pin `fill_mode="none"`; `/capabilities` says so per column.
 
 ```
 GET /metrics/catalog                 names, first/last ts, point counts
+GET /                                service index
 GET /metrics/{name}?period=5m&start=…&end=…&node=nxp-book:5m
 GET /health        contract v1 (nxp-node-contract), + per-stream capture freshness from memory
 GET /coverage      per-stream sessions / resyncs / snapshot density, per-metric density vs declaration
 GET /capabilities  meaning + fill rule per column; service block from the node's own OpenAPI
-GET /book/{label}?levels=10          live in-memory book (operator view)
-GET /stream/book/{label}             the same as Server-Sent Events, on every sequence advance
+GET /book/{label}?levels=10          live in-memory book (operator view, levels ≤ 500)
+GET /stream/book/{label}?levels=10&interval_ms=250
+                                     the same as Server-Sent Events, on every sequence
+                                     advance, at most one event per interval_ms (100–5000)
 ```
 
 `/health.ok` is the AND of: database answers, collectors + scheduler running,
-**every stream connected, synced and heard from within 60 s**, every grid
-column within 30 min, no failed gate. A reconnect shows as `ok=false` for as
+**every stream connected, synced and heard from within 60 s**
+(`BOOK_MAX_STREAM_LAG_SECONDS`), the grid within 20 min
+(`BOOK_MAX_GRID_LAG_SECONDS=1200`), no failed gate. A reconnect shows as `ok=false` for as
 long as it lasts and as a `stream_runs` boundary forever.
 
-## 7. Run
+**Scheduler.** Two in-process jobs, both idempotent: `derive_tail` every
+5 min (`BOOK_DERIVE_TAIL_SECONDS`, republishes the last `BOOK_DERIVE_TAIL_HOURS`
+= 6 h) and `derive_full` daily (`BOOK_DERIVE_FULL_SECONDS`). Capture is not in
+the scheduler — the collectors run on their own tasks, so a slow derive can
+never stall a WebSocket read.
+
+## 7. Configuration
+
+Everything is an environment variable (`api/src/core/config.py`);
+`.env.example` documents the ones an operator sets:
+
+| Variable | Default | What |
+|---|---|---|
+| `BOOK_DB_HOST` / `_PORT` / `_DATABASE` / `_USER` / `_PASSWORD` | `book-db` / `5432` / `book` / `nxp_book` / — | the TimescaleDB |
+| `BOOK_DB_DATA_DIR` | `/mnt/warehouse/nxp-book/pgdata` | compose bind mount for pgdata |
+| `NODE_ID` | `nxp-book` | node id in `/health` and the stream key |
+| `BOOK_STREAMS` | the three streams above | `venue:SYMBOL:label,…` — venues `binance_spot`, `binance_futures`, `deribit`; a bad entry fails startup |
+| `BOOK_SNAPSHOT_INTERVAL_SECONDS` / `BOOK_SNAPSHOT_LEVELS` | `300` / `2000` | replay-anchor cadence and depth |
+| `BOOK_EVENTS_RETENTION_DAYS` | `0` (keep all) | raw diff retention |
+| `BOOK_DEPTH_BANDS_BPS` | `10,50` | bands for the depth / imbalance columns |
+| `BOOK_COLLECTORS_ENABLED` / `BOOK_SCHEDULER_ENABLED` | `true` | switch capture / derive off (e.g. for a read-only replica) |
+| `BOOK_USER_AGENT` | `nxpNodeBook/0.1 (…)` | sent to the venues; keep a contact address in it |
+| `BOOK_BINANCE_*`, `BOOK_DERIBIT_*` | public endpoints, 100 ms | venue URLs, depth speed, snapshot limits — rarely touched |
+| `NXP_WAREHOUSE_NOTIFY_URL`, `NXP_STREAM_TICKET_SECRET`, `NXP_WAREHOUSE_SOURCE_ID` | unset | **optional** doc/54 E5 "rows landed" notify to nxp-ingest; all three or the node silently does nothing (see `.env.example`) |
+
+The notify (`collectors/notify.py`) is purely an optimisation: fire-and-forget
+from the writer, ≤ 1 per 5 s, 2 s timeout, never awaited by a COPY. The
+warehouse still polls on its own schedule.
+
+## 8. Run
 
 ```bash
 cp .env.example .env            # set BOOK_DB_PASSWORD
@@ -165,7 +199,24 @@ pip install -r api/requirements.txt pytest pytest-asyncio ../nxpNodeContract
 cd api && python -m pytest -q
 ```
 
-## 8. Status
+## 9. Layout
+
+```
+api/src/
+  adapters/sources/   binance.py, deribit.py — venue WebSocket + REST protocol
+  adapters/database/  pool, schema bootstrap, raw + grid repositories
+  collectors/         StreamCollector (one per stream), manager, DBWriter, notify
+  domain/book.py      the snapshot/diff join rules (pure, tested)
+  derive/             5-min grid features + runner
+  qa/gates.py         gates every derive must pass before it publishes
+  scheduler/          derive_tail / derive_full loop
+  services/           health + metrics services
+  api/routes/         /, /health, /coverage, /capabilities, /metrics, /book, /stream
+db/init/              extensions + schema (applied by the API on every start)
+scripts/              cutover-to-k8s.sh, staging ExternalName manifest
+```
+
+## 10. Status
 
 Collecting since **2026-09-13 19:54 UTC** on the warehouse host (compose).
 
@@ -182,8 +233,18 @@ is one script — it stops compose, runs the helm upgrade, waits, verifies:
 ./scripts/cutover-to-k8s.sh           # the move; gap ≈ 1–2 min, declared in stream_runs
 ```
 
+Note that the monitoring stack (`node-health-exporter`, the order-book alerts)
+already probes `nxp-book-api.prod.svc:9130`, so it only sees the node once the
+cutover has run — confirm where it lives with
+`kubectl -n prod get deploy nxp-book-api` before trusting either path.
+
 After the move the compose file stays as the local/dev runner. Never run
 both against the same pgdata.
 
-The warehouse still needs an `nxp_book` adapter (near-copy of `nxp_options`)
-before the columns reach a pipeline.
+The warehouse has no `nxp_book` pull adapter yet (a near-copy of
+`nxp_options` would do), so the 5-minute columns do not reach a pipeline. What
+*is* consumed is the live SSE: the doc/55 streaming sources in nxp-ingest read
+`/stream/book/{label}` for the live order-book charts (see
+`nxpWarehouse/doc/55_streaming_sources/`), and the order-book alerts in
+`nxpWarehouse/k8s/monitoring/alert-rules-orderbook.yaml` mail on a stalled
+capture stream.
